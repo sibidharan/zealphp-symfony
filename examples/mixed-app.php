@@ -76,6 +76,17 @@ App::superglobals(true);
 // routes outside the Symfony fallback, the underlying $g->session is
 // available via session_start() + $_SESSION as usual.
 App::sessionLifecycle(false);
+
+// Skip the CGI subprocess for App::include() calls. In superglobals(true)
+// mode, ZealPHP defaults to dispatching every included .php file through
+// cgi_worker.php via proc_open() — Apache mod_php-style isolation that
+// WordPress / Drupal need. Symfony's Kernel is intentionally booted once
+// per worker and reused; native helper routes don't redefine classes or
+// constants between requests. Paying ~30-50 ms of PHP startup + autoloader
+// load per include is dead weight for this workload, so we opt out.
+// Requires zealphp ^0.2.23 (App::processIsolation() landed there).
+App::processIsolation(false);
+
 $app = App::init('0.0.0.0', 9090);
 
 Store::make('chat_clients', 256, [
