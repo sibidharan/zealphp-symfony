@@ -1,0 +1,11 @@
+/vendor/
+# The Symfony Demo is materialised by examples/setup-symfony-demo.sh — never vendored.
+/examples/symfony-demo/
+/composer.lock
+/bench/results/
+*.log
+*.pid
+.DS_Store
+.idea/
+.vscode/
+.phpunit.result.cache
