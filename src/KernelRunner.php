@@ -58,6 +58,15 @@ final class KernelRunner
         // We don't want ZealPHP's route table or middleware stack — Symfony
         // is the entire router. So we register a single catch-all fallback
         // and let Symfony handle everything.
+        //
+        // Coroutine mode (App::superglobals(false)) is the whole point of
+        // running on OpenSwoole: HOOK_ALL converts Doctrine PDO queries,
+        // Symfony HttpClient curl calls, and file I/O into coroutine-yielding
+        // operations. One worker can serve dozens of concurrent requests
+        // because they all yield on I/O instead of blocking. Symfony itself
+        // is synchronous PHP; it doesn't need to be coroutine-aware — the
+        // hooks happen transparently below it.
+        App::superglobals(false);
         $app = App::init($host, $port);
 
         // The boot must run inside the worker process (after fork), not in
@@ -69,7 +78,11 @@ final class KernelRunner
 
         $app->setFallback(self::asHandler($kernel));
 
-        return $app->run($settings) ?? 0;
+        // $app->run() returns void and blocks forever in normal operation.
+        // The `return 0` is unreachable under SIGTERM but satisfies the
+        // RuntimeInterface contract that requires an int exit code.
+        $app->run($settings);
+        return 0;
     }
 
     /**
