@@ -158,6 +158,42 @@ If your custom service holds request-scoped state, implement `ResetInterface` an
 
 **Doctrine connection caveat**: connections are pooled across requests, not opened fresh per request. The `services_resetter` clears the `EntityManager`'s unit-of-work but the underlying `Connection` survives. If your app uses `SET SESSION` statements, savepoints, or temp tables, reset them explicitly via a `kernel.finish_request` listener.
 
+## Caveats — what to know before running this in prod
+
+Honest list of gaps you'll hit, organised by what will bite you first. None of these are dealbreakers — they're things to think about, same as you'd think about with RoadRunner, FrankenPHP, or Octane.
+
+### Will hit you on day one
+
+- **Workers don't auto-recycle.** ZealPHP defaults `max_request` to 100,000 globally but the bridge doesn't enforce a Symfony-aware recycle policy. Symfony has known small leaks (Twig template cache growth, Doctrine metadata accumulation, lazy-proxied container references). A busy worker hits multi-GB RSS over days. Pass `'max_request' => 1000` (or whatever fits your churn) in your `app.php` settings, and pair it with `OnWorkerStart` warmup so the recycle cost is amortised. RoadRunner / Octane both default to similar values.
+
+- **Trusted proxies and `X-Forwarded-For` are not auto-wired.** Behind Caddy/nginx/Traefik, `$request->getClientIp()` will return the proxy IP, `$request->isSecure()` will return `false` for HTTPS traffic terminated at the proxy, and rate-limiters / IP allow-lists / `getRealIp()` will all be wrong. Call `Request::setTrustedProxies([...your proxy CIDRs...], Request::HEADER_X_FORWARDED_FOR | Request::HEADER_X_FORWARDED_PROTO)` from a `kernel.request` listener (or use Symfony's [`framework.trusted_proxies`](https://symfony.com/doc/current/deployment/proxies.html) config). The bridge can't do this for you because trust depends on your deployment topology.
+
+- **Cold-boot tax per worker on the first request.** Symfony compiles the container on the first request to each fresh worker (~200-500ms). With 4 workers, that's 4 cold-boot taxes after every deploy. Run `php bin/console cache:warmup` (and `--env=prod --no-debug` for prod) in your deploy pipeline before starting the server.
+
+- **WebSocket handlers bypass the Symfony security firewall.** `$app->ws()` is native ZealPHP — Symfony's firewall config doesn't apply because the WS handler never touches the Kernel. If you want session-authenticated WS, read `$request->cookie['PHPSESSID']` in `onOpen`, look up the session in your storage (Symfony's session save handler is fine — `session_id($cookieValue); session_start(); $userId = $_SESSION['user_id'] ?? null;`), and close the connection with a 1008 status if auth fails. Same pattern as Centrifugo / Mercure — security is your call, not the framework's.
+
+- **Long-running PHP discipline contract still applies.** `static $cache = []` inside a method, singletons created in a service constructor, globals you mutate, `define()` calls — all persist across requests on the same worker. Symfony itself is well-behaved here (it has `services_resetter` for exactly this); third-party bundles and your own code are not always. If a value should reset per request, register your service with [`Symfony\Contracts\Service\ResetInterface`](https://github.com/symfony/contracts/blob/main/Service/ResetInterface.php) — the bridge calls `services_resetter` after every `Kernel::terminate()`.
+
+### Developer experience
+
+- **Edit a Twig template, refresh — still serves the old version.** The kernel + Twig cache live in the worker's memory until the worker recycles. RoadRunner has a `--debug` mode that watches files; we don't. Workaround: in dev mode, run with `worker_num=1` and pass `max_request=1` so each request gets a fresh worker. Slower, but file edits propagate immediately.
+
+- **Profiler caches accumulate on disk.** Symfony's profiler writes one file per request to `var/cache/dev/profiler/{token}`. Per-request, every request. Disk fills. Same problem on stock Symfony dev — just more visible at long-running throughput. Cron a `cache:clear` or trim `var/cache/dev/profiler/` manually.
+
+- **Symfony Messenger needs separate consumer processes.** Messenger expects you to run `bin/console messenger:consume` in a separate worker pool. OpenSwoole's task workers (`'task_worker_num' => N`) are conceptually the right fit, but the bridge doesn't wire them to Messenger transports yet. For now, run Messenger consumers as separate `php bin/console messenger:consume` processes alongside the ZealPHP HTTP workers — same as you would with php-fpm.
+
+### Edge cases worth knowing
+
+- **`StreamedResponse` is buffer-collected, not actually streamed.** Sending Server-Sent Events with the default `$response = new StreamedResponse(...)` will collect the entire response in memory before flushing. SSE works but doesn't stream incrementally. True per-chunk streaming needs an OpenSwoole-aware emitter; on the roadmap.
+
+- **`$_GET`/`$_POST`/`$_FILES` are empty** because the bridge calls `App::superglobals(false)` for coroutine isolation. Symfony itself reads the request via the `Request` object (which we build correctly), so it doesn't notice. But legacy bundles or your own old code that read `$_GET` directly will see nothing. Either rewrite to use `$request->query->get(...)` or flip the bridge to `App::superglobals(true)` and accept the request-serialisation cost.
+
+- **File uploads pass through, lightly tested.** `$swoole->files` is mapped to Symfony's `Request->files` via the standard format (`tmp_name`, `size`, `error`, `name`, `type`). Should work for the common case; if you hit weirdness with multipart parsing report a repro.
+
+- **Doctrine connection state survives across requests.** This is the same `SET SESSION` / temporary tables / `GET_LOCK` / user-variables family of issues that the v0.3 `PDOPool` design has to solve. Today the bridge does not pool connections itself — Doctrine's own connection survives per worker, which means state leaks across requests on the same worker. The v0.3 `MysqlPool` / `PgsqlPool` work (driver-aware reset via `COM_RESET_CONNECTION` / `DISCARD ALL`) is the structural fix. Until then: avoid `SET SESSION`, `CREATE TEMPORARY TABLE`, `GET_LOCK`, and user-variables in request-path code, or wrap them in `try/finally` that resets them.
+
+- **Symfony's signal handlers won't propagate cleanly through OpenSwoole.** Symfony 6.4+ has a `SignalRegistry` for things like `Console::handleSignals()`. OpenSwoole installs its own signal handlers for `SIGTERM` / `SIGUSR1` (graceful restart). If your code installs a signal handler via `pcntl_signal()`, it'll be overwritten. Use OpenSwoole's `$server->on('Shutdown', ...)` instead.
+
 ## Compatibility
 
 - PHP 8.2+ (Symfony Runtime requirement) / 8.3+ recommended (ZealPHP target)
