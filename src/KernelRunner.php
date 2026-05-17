@@ -67,6 +67,19 @@ final class KernelRunner
         // is synchronous PHP; it doesn't need to be coroutine-aware — the
         // hooks happen transparently below it.
         App::superglobals(false);
+
+        // Symfony's NativeSessionStorage owns the session lifecycle
+        // (PHPSESSID cookie minting, $_SESSION populate/save, session_id
+        // generation). Without this opt-out, ZealPHP's SessionManager also
+        // mints a session ID + emits its own Set-Cookie at request entry,
+        // producing TWO conflicting PHPSESSID headers on the wire. The
+        // sessionLifecycle(false) toggle skips ZealPHP's session-specific
+        // work but keeps request-context init ($g->openswoole_request,
+        // $g->zealphp_response, error-stack reset). Native ZealPHP routes
+        // that want session access can still call session_*() — those uopz
+        // overrides remain installed and read/write $g->session as usual.
+        App::sessionLifecycle(false);
+
         $app = App::init($host, $port);
 
         // The boot must run inside the worker process (after fork), not in
