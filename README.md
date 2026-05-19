@@ -120,6 +120,52 @@ That's it — register the factory and point `framework.session.storage_factory_
 
 > **Why the coroutine scheduler is off.** Symfony's container services (session listener, security token storage, …) are per-worker singletons that are not coroutine-aware. With the scheduler ON, concurrent coroutines on one worker race that shared state and bleed sessions across users. The bridge therefore serialises requests per worker. If you need parallel I/O inside a request, push it to an OpenSwoole task worker. Coroutine-per-request concurrency for stateful Symfony apps needs a coroutine-aware container and is tracked for a future release.
 
+### Parallel I/O inside a request (the coroutine escape hatch)
+
+The bridge runs the Symfony Kernel with the coroutine scheduler OFF (see the box above), so you can't `go()` directly in a controller — it would race the per-worker singletons. When a request genuinely needs N concurrent slow I/O calls (fan out to several HTTP APIs, prime several caches), use `ZealPHP\coprocess()`: it spawns a throwaway child process that DOES have the scheduler, runs your closure there with real coroutines, blocks until done, and hands back whatever the child echoed.
+
+```php
+// src/Controller/AggregateController.php
+use function ZealPHP\coprocess;
+use OpenSwoole\Coroutine\Channel;
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\Routing\Attribute\Route;
+
+final class AggregateController
+{
+    #[Route('/dashboard', name: 'dashboard')]
+    public function __invoke(): JsonResponse
+    {
+        $endpoints = [
+            'weather' => 'https://api.example.com/weather',
+            'prices'  => 'https://api.example.com/prices',
+            'news'    => 'https://api.example.com/news',
+        ];
+
+        // Fan out all three fetches concurrently in a coroutine child process.
+        $json = coprocess(function () use ($endpoints) {
+            $chan = new Channel(count($endpoints));
+            foreach ($endpoints as $key => $url) {
+                go(function () use ($key, $url, $chan) {
+                    // file_get_contents / curl are coroutine-hooked here — the
+                    // three requests overlap instead of running back-to-back.
+                    $chan->push([$key => json_decode(file_get_contents($url), true)]);
+                });
+            }
+            $out = [];
+            for ($i = 0; $i < count($endpoints); $i++) { $out += $chan->pop(); }
+            echo json_encode($out);   // returned to the controller as a string
+        });
+
+        return new JsonResponse(json_decode($json, true));
+    }
+}
+```
+
+Three 200ms calls finish in ~200ms, not ~600ms. **Caveats:** the child is a fresh process — it can't reach Symfony services or Doctrine's managed connection, so do raw I/O inside (HTTP, file, a raw PDO you open in the closure) and pass everything it needs as captured variables. There's a ~1ms fork per call, so reserve it for real fan-out, not single calls.
+
+For **fire-and-forget / deferred** work (send an email, warm a cache, post a webhook) that shouldn't block the response, use OpenSwoole **task workers** instead: set `task_worker_num` in the runtime `settings`, register an `onTask` handler, and dispatch with `App::getServer()->task([...])`. Task workers run in coroutine mode by default.
+
 ### B. ZealPHP-native with Symfony mounted (mixed mode)
 
 Write a custom `app.php` (see `examples/mixed-app.php` for the full thing). Use this when you want native ZealPHP routes / WebSocket alongside Symfony — the actual unique-value path.
