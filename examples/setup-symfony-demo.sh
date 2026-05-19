@@ -60,6 +60,37 @@ else
 JSON
 fi
 
+# Wire the coroutine-safe session storage so $_SESSION actually persists under
+# the long-running worker (otherwise Symfony emits PHPSESSID=deleted every
+# request). See README "Sessions (required wiring)".
+echo "==> Wiring session storage factory (framework.yaml + services.yaml)..."
+if ! grep -q 'CoroutineSessionStorageFactory' config/packages/framework.yaml; then
+    # framework.session: -> storage_factory_id
+    python3 - <<'PY'
+import re
+p = 'config/packages/framework.yaml'
+s = open(p).read()
+# Replace a bare "session: true" with the factory block; else append under framework:
+if re.search(r'^\s*session:\s*true\s*$', s, re.M):
+    s = re.sub(r'^(\s*)session:\s*true\s*$',
+               r'\1session:\n\1    storage_factory_id: ZealPHP\\Symfony\\Session\\CoroutineSessionStorageFactory',
+               s, count=1, flags=re.M)
+else:
+    s = s.replace('framework:\n',
+                  'framework:\n    session:\n        storage_factory_id: ZealPHP\\Symfony\\Session\\CoroutineSessionStorageFactory\n', 1)
+open(p, 'w').write(s)
+PY
+fi
+if ! grep -q 'CoroutineSessionStorageFactory' config/services.yaml; then
+    cat >> config/services.yaml <<'YAML'
+
+    # zealphp-symfony: route Symfony sessions through ZealPHP's session store
+    ZealPHP\Symfony\Session\CoroutineSessionStorageFactory:
+        arguments:
+            $options: '%session.storage.options%'
+YAML
+fi
+
 # Re-dump autoload so vendor/autoload_runtime.php picks up the extra.runtime.class.
 composer dump-autoload
 

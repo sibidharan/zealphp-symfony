@@ -42,6 +42,17 @@ use ZealPHP\App;
 final class KernelRunner
 {
     /**
+     * Snapshot of the dotenv-loaded config env ($_SERVER at worker start,
+     * before any request clobbers it). superglobals(true) mode REPLACES
+     * $_SERVER per request with the OpenSwoole request vars, which would wipe
+     * APP_SECRET / DATABASE_URL / DEFAULT_URI / APP_ENV etc. — so we restore
+     * this snapshot on every request before the Kernel resolves %env(...)%.
+     *
+     * @var array<string, mixed>
+     */
+    private static array $envSnapshot = [];
+
+    /**
      * Standalone server. Boots the Kernel inside an OpenSwoole onWorkerStart
      * hook (one boot per worker), then dispatches each onRequest through the
      * Kernel. Blocks until the server stops.
@@ -59,25 +70,33 @@ final class KernelRunner
         // is the entire router. So we register a single catch-all fallback
         // and let Symfony handle everything.
         //
-        // Coroutine mode (App::superglobals(false)) is the whole point of
-        // running on OpenSwoole: HOOK_ALL converts Doctrine PDO queries,
-        // Symfony HttpClient curl calls, and file I/O into coroutine-yielding
-        // operations. One worker can serve dozens of concurrent requests
-        // because they all yield on I/O instead of blocking. Symfony itself
-        // is synchronous PHP; it doesn't need to be coroutine-aware — the
-        // hooks happen transparently below it.
-        App::superglobals(false);
-
-        // Symfony's NativeSessionStorage owns the session lifecycle
-        // (PHPSESSID cookie minting, $_SESSION populate/save, session_id
-        // generation). Without this opt-out, ZealPHP's SessionManager also
-        // mints a session ID + emits its own Set-Cookie at request entry,
-        // producing TWO conflicting PHPSESSID headers on the wire. The
-        // sessionLifecycle(false) toggle skips ZealPHP's session-specific
-        // work but keeps request-context init ($g->openswoole_request,
-        // $g->zealphp_response, error-stack reset). Native ZealPHP routes
-        // that want session access can still call session_*() — those uopz
-        // overrides remain installed and read/write $g->session as usual.
+        // LIFECYCLE — session-safe Mixed-mode is the default:
+        //
+        //   superglobals(true)     — $g is a process-wide singleton (no
+        //                            coroutine context needed) and PHP's
+        //                            $_GET/$_POST/$_COOKIE/$_SESSION are
+        //                            populated per request (zealphp >= 0.2.27).
+        //   enableCoroutine(false) — one request at a time per worker. This is
+        //                            REQUIRED for session safety: Symfony's
+        //                            container services (session listener,
+        //                            security token storage, ...) are per-worker
+        //                            singletons that are NOT coroutine-aware;
+        //                            concurrent coroutines on one worker would
+        //                            race their shared state and bleed sessions
+        //                            across users. Scale via worker_num, FPM-style.
+        //   processIsolation(false)— no per-include CGI fork; Kernel booted once
+        //                            per worker and reused.
+        //   sessionLifecycle(false)— Symfony owns the session; ZealPHP doesn't
+        //                            mint a competing PHPSESSID.
+        //
+        // Sessions are served by ZealPHP\Symfony\Session\CoroutineSessionStorage
+        // (wire it via framework.session.storage_factory_id — see README).
+        // Coroutine-per-request concurrency for stateful Symfony apps needs a
+        // coroutine-aware container and is tracked for a future release; until
+        // then, push async/parallel I/O work to OpenSwoole task workers.
+        App::superglobals(true);
+        App::enableCoroutine(false);
+        App::processIsolation(false);
         App::sessionLifecycle(false);
 
         $app = App::init($host, $port);
@@ -86,6 +105,10 @@ final class KernelRunner
         // the master — bundles spawn timers, open connections, etc., that
         // belong to the worker. ZealPHP's onWorkerStart() guarantees that.
         App::onWorkerStart(static function () use ($kernel) {
+            // Capture the dotenv config env BEFORE the first request clobbers
+            // $_SERVER (superglobals(true) mode). Restored per request in
+            // asHandler() so Symfony can resolve %env(APP_SECRET)% etc.
+            self::$envSnapshot = $_SERVER;
             $kernel->boot();
         });
 
@@ -116,6 +139,35 @@ final class KernelRunner
             $swooleReq = $g->openswoole_request;
             /** @var SwooleResponse $swooleResp */
             $swooleResp = $g->openswoole_response;
+
+            // Per-request session-state reset. The Kernel + its container
+            // services (AbstractSessionListener, session storage, security
+            // token storage) are booted once per worker and reused. In
+            // superglobals(true) + enableCoroutine(false), $g is a process-wide
+            // singleton and $GLOBALS['_SESSION'] persists between requests on a
+            // worker — without an explicit wipe, request N sees request N-1's
+            // session id / data (observed as flaky "PHPSESSID=deleted" and
+            // cross-session bleed under sustained load). Clear every carrier so
+            // each request re-hydrates from its own cookie via
+            // CoroutineSessionStorage::loadSession().
+            $g->_session_started = false;
+            $g->session = [];
+            unset($GLOBALS['_SESSION']);
+
+            // superglobals(true) mode REPLACES $_SERVER with the per-request
+            // OpenSwoole vars each request, wiping the dotenv-loaded config env
+            // (DEFAULT_URI, APP_SECRET, DATABASE_URL, APP_ENV, ...) that Symfony
+            // resolves %env(...)% placeholders against. Restore the worker-start
+            // snapshot (request vars win on key collisions so HTTP_* etc. stay
+            // correct). Also mirror into $_ENV for EnvVarProcessor's first lookup.
+            foreach (self::$envSnapshot as $envKey => $envVal) {
+                if (!array_key_exists($envKey, $_SERVER)) {
+                    $_SERVER[$envKey] = $envVal;
+                }
+                if (!array_key_exists($envKey, $_ENV)) {
+                    $_ENV[$envKey] = $envVal;
+                }
+            }
 
             $symfonyReq = self::buildSymfonyRequest($swooleReq);
 

@@ -95,6 +95,31 @@ Add to your Symfony app's `composer.json`:
 
 Then `composer dump-autoload` and `php public/index.php`. Your existing Symfony app now runs on OpenSwoole with the Kernel cached per worker. Use this when you have a working Symfony app and just want the long-running runtime — no native routes, no WebSocket, no extras.
 
+### Sessions (required wiring)
+
+Symfony's `NativeSessionStorage` reads and writes the `$_SESSION` superglobal directly. Under a long-running OpenSwoole worker that does NOT behave the way the SAPI does — `session_status()` always reports active, the per-request `$_SERVER`/`$_SESSION` reset is the framework's job, and PHP never re-populates `$_SESSION` from the cookie. Left alone, every Symfony request sees an empty session and emits `Set-Cookie: PHPSESSID=deleted` — sessions never persist.
+
+The bridge ships a drop-in storage that fixes this. Wire it in two files:
+
+```yaml
+# config/packages/framework.yaml
+framework:
+    session:
+        storage_factory_id: ZealPHP\Symfony\Session\CoroutineSessionStorageFactory
+```
+
+```yaml
+# config/services.yaml
+services:
+    ZealPHP\Symfony\Session\CoroutineSessionStorageFactory:
+        arguments:
+            $options: '%session.storage.options%'
+```
+
+That's it — register the factory and point `framework.session.storage_factory_id` at it. `KernelRunner` runs the app in the session-safe lifecycle (`superglobals(true) + enableCoroutine(false) + processIsolation(false) + sessionLifecycle(false)`): one request at a time per worker, native `$_SESSION` populated per request, scale via `worker_num` (FPM-style).
+
+> **Why the coroutine scheduler is off.** Symfony's container services (session listener, security token storage, …) are per-worker singletons that are not coroutine-aware. With the scheduler ON, concurrent coroutines on one worker race that shared state and bleed sessions across users. The bridge therefore serialises requests per worker. If you need parallel I/O inside a request, push it to an OpenSwoole task worker. Coroutine-per-request concurrency for stateful Symfony apps needs a coroutine-aware container and is tracked for a future release.
+
 ### B. ZealPHP-native with Symfony mounted (mixed mode)
 
 Write a custom `app.php` (see `examples/mixed-app.php` for the full thing). Use this when you want native ZealPHP routes / WebSocket alongside Symfony — the actual unique-value path.
