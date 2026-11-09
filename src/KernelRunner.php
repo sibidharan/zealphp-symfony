@@ -133,6 +133,13 @@ final class KernelRunner
      */
     public static function asHandler(HttpKernelInterface $kernel): \Closure
     {
+        // Callers that wire the handler themselves (examples/mixed-app.php)
+        // never run serve()'s worker-start hook, so take the snapshot here
+        // too: the handler is created at boot, after dotenv has loaded and
+        // before any request has replaced $_SERVER.
+        if (self::$envSnapshot === []) {
+            self::$envSnapshot = $_SERVER;
+        }
         return static function () use ($kernel): void {
             $g = \ZealPHP\RequestContext::instance();
             /** @var SwooleRequest $swooleReq */
